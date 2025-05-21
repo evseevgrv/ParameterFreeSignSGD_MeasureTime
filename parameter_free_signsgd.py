@@ -5,6 +5,7 @@ from torch import Tensor
 
 from torch.optim.optimizer import (
     _default_to_fused_or_foreach,
+    # _device_dtype_check_for_fused,
     _use_grad_for_differentiable,
     Optimizer,
 )
@@ -70,7 +71,7 @@ class AIDsignSGD(Optimizer):
             nesterov=nesterov,
 
             lr=lr,
-            warmup_steps=warmup_steps,
+            warmup_steps=warmup_steps, # used only to avoid overwriting scheduler logic / AND for warmup period
 
             clamp_level=1e-3 if clamp_level is None else clamp_level,
 
@@ -89,7 +90,7 @@ class AIDsignSGD(Optimizer):
             if foreach:
                 raise RuntimeError("`fused` and `foreach` cannot be `True` together.")
 
-    def __setstate__(self, state):   
+    def __setstate__(self, state):  # noqa: D105
         super().__setstate__(state)
         for group in self.param_groups:
             group.setdefault("foreach", None)
@@ -102,18 +103,23 @@ class AIDsignSGD(Optimizer):
         if group["lambda_denom_sum"] is None:
             group["lambda_denom_sum"] = convert_to_tensor(group["L_inf"], device=device, dtype=dtype)
             group["clamp_level"] = convert_to_tensor(group["clamp_level"], device=device, dtype=dtype)
+        # init tilde_d and prev_gamma
         if group["d"] is not None and group["tilde_d"] is None:
             group["d"] = convert_to_tensor(group["d"], device=device, dtype=dtype)
             group["tilde_d"] = torch.tensor(0.0, device=device, dtype=dtype)
+            # group["prev_gamma"] = torch.tensor(0.0, device=device, dtype=dtype)
             group["prev_gamma"] = []
+        # init f_0 - lower_bound and prev_gamma
         elif group["lower_bound"] is not None and group["f_diff"] is None:
             assert loss is not None, "One have to pass f_0 (loss) to the first step of algorithm."
-            group["f_diff"] = convert_to_tensor(loss, device=device, dtype=dtype) - convert_to_tensor(group["lower_bound"], device=device, dtype=dtype) 
+            group["f_diff"] = convert_to_tensor(loss, device=device, dtype=dtype) - convert_to_tensor(group["lower_bound"], device=device, dtype=dtype) # yes, it is cringe
+            # group["prev_gamma"] = torch.tensor(0.0, device=device, dtype=dtype)
             group["prev_gamma"] = []
         if "step" not in group:
             group["step"] = 0
 
         for p in group['params']:
+            # init lambda_denom_sum
             if p.grad is not None:
                 params.append(p)
                 grads.append(p.grad)
@@ -208,6 +214,8 @@ def aid_sign_sgd(
     d_p_list: List[Tensor],
     prev_grad_list: List[Optional[Tensor]],
     prev_param_list: List[Optional[Tensor]],
+    # kwonly args with defaults are not supported by functions compiled with torchscript issue #70627
+    # setting this as kwarg for now as functional API is compiled by torch/distributed/optim
     has_sparse_grad: bool = False,
     foreach: Optional[bool] = None,
     fused: Optional[bool] = None,
@@ -217,6 +225,7 @@ def aid_sign_sgd(
     weight_decay: float,
     d: torch.tensor,
     tilde_d: torch.tensor,
+    # prev_gamma: torch.tensor,
     prev_gamma,
 
     momentum_buffer_list,
@@ -237,7 +246,13 @@ def aid_sign_sgd(
 
     See :class:`~torch.optim.SGD` for details.
     """
+    # Respect when the user inputs False/True for foreach or fused. We only want to change
+    # the default when neither have been user-specified. Note that we default to foreach
+    # and pass False to use_fused. This is not a mistake--we want to give the fused impl
+    # bake-in time before making it the default, even if it is typically faster.
     if foreach is None:
+        # why must we be explicit about an if statement for torch.jit.is_scripting here?
+        # because JIT can't handle Optionals nor fancy conditionals when scripting
         if not torch.jit.is_scripting():
             _, foreach = _default_to_fused_or_foreach(params, differentiable=False, use_fused=False)
         else:
@@ -302,6 +317,7 @@ def _single_tensor_aid_sign_sgd(
     weight_decay: float,
     d: torch.tensor,
     tilde_d: torch.tensor,
+    # prev_gamma: torch.tensor,
     prev_gamma,
     lambda_denom_sum: torch.tensor,
     f_diff: Optional[float],
@@ -323,6 +339,7 @@ def _single_tensor_aid_sign_sgd(
 
     if step >= warmup_steps:
         if step % update_gap == 0:
+            # if prev_gamma != 0.0: # prev_gamma == 0.0 only on step = 0
             if step > warmup_steps:
                 numerator_norm = torch.linalg.vector_norm(
                     torch.stack(
@@ -337,19 +354,24 @@ def _single_tensor_aid_sign_sgd(
                 lambda_denom_sum.add_(numerator_norm / denominator_norm)
 
             if tilde_d is not None:
+                # if prev_gamma != 0.0: # prev_gamma == 0.0 only on step = 0
                 if step > warmup_steps:
+                    # tilde_d.add_(sum((g * prev_g.sign()).sum() for g, prev_g in zip(grads, prev_grad_list) * prev_gamma))
                     tilde_d.add_(sum((g * prev_g.sign() * pr_gamma).sum() for g, prev_g, pr_gamma in zip(grads, prev_grad_list, prev_gamma)))
                 d = torch.max(d, tilde_d, out=d)
                 gamma = (d.div(lambda_denom_sum)).sqrt()
             else:
                 gamma = (f_diff.div(lambda_denom_sum)).sqrt()
             gamma.clamp_(max=clamp_level)
+            # prev_gamma.copy_(gamma)
             prev_gamma.append(gamma.clone())
+        # lr.copy_(prev_gamma)
         lr.copy_(prev_gamma[-1])
 
     for i, param in enumerate(params):
         grad = grads[i] if not maximize else -grads[i]
 
+        # if prev_grad_list[i] is None:
         if step % update_gap == 0:
             prev_grad_list[i] = torch.clone(grads[i].detach())
             prev_param_list[i] = torch.clone(param.detach())
@@ -373,7 +395,8 @@ def _single_tensor_aid_sign_sgd(
 
         param.add_(grad.sign(), alpha=-lr)
 
-class AIDWithAdam(Optimizer):  
+# ALIAS optimizer 
+class AIDWithAdam(Optimizer):  # noqa: D101
     def __init__(
         self,
         params,
@@ -394,7 +417,7 @@ class AIDWithAdam(Optimizer):
         adam_eps: float = 1e-8,
         adam_amsgrad: bool = False,
         
-        warmup_steps=0, 
+        warmup_steps=0, # warmup period for AIDsignSGD
         *,
         maximize: bool = False,
         foreach: Optional[bool] = None,
@@ -411,7 +434,7 @@ class AIDWithAdam(Optimizer):
         super().__init__([group for group in params], defaults)
         del self.param_groups
         aid_params = [group for group in params if self._is_sgd_group(group)]
-        adam_params = [group for group in params if not self._is_sgd_group(group)]
+        # adam_params = [group for group in params if not self._is_sgd_group(group)]
 
         aid_sign_sgd = AIDsignSGD(
             aid_params, 
@@ -432,24 +455,31 @@ class AIDWithAdam(Optimizer):
             lr=adam_lr,
             warmup_steps=warmup_steps,
         )
+        # for group in aid_sign_sgd.param_groups:
+        #     group.update({
+        #         "sign": sign,
+        #         "sign_norm": sign_norm,
+        #         "normalized": normalized
+        #     })
 
-        adam = torch.optim.AdamW(
-            adam_params,
-            lr=adam_lr,
-            betas=adam_betas,
-            eps=adam_eps,
-            weight_decay=weight_decay,
-            amsgrad=adam_amsgrad,
+        # adam = torch.optim.AdamW(
+        #     adam_params,
+        #     lr=adam_lr,
+        #     betas=adam_betas,
+        #     eps=adam_eps,
+        #     weight_decay=weight_decay,
+        #     amsgrad=adam_amsgrad,
 
-            maximize=maximize,
-            foreach=foreach,
-            fused=fused,
-            differentiable=differentiable,
-        )
-        self.param_groups = aid_sign_sgd.param_groups + adam.param_groups
+        #     maximize=maximize,
+        #     foreach=foreach,
+        #     fused=fused,
+        #     differentiable=differentiable,
+        # )
+        # self.param_groups = aid_sign_sgd.param_groups + adam.param_groups
+        self.param_groups = aid_sign_sgd.param_groups 
 
         self._init_group_aid = AIDsignSGD._init_group.__get__(self)
-        self._init_group_adam = AdamW._init_group.__get__(self)
+        # self._init_group_adam = AdamW._init_group.__get__(self)
 
         self._get_loss = aid_sign_sgd._get_loss
 
@@ -513,55 +543,56 @@ class AIDWithAdam(Optimizer):
                     state["prev_grad"] = prev_grad
                     state["prev_param"] = prev_param
                 
-            else:
-                params_with_grad = []
-                grads = []
-                exp_avgs = []
-                exp_avg_sqs = []
-                max_exp_avg_sqs = []
-                state_steps = []
-                amsgrad = group["amsgrad"]
-                beta1, beta2 = group["betas"]
+            # else:
+            #     params_with_grad = []
+            #     grads = []
+            #     exp_avgs = []
+            #     exp_avg_sqs = []
+            #     max_exp_avg_sqs = []
+            #     state_steps = []
+            #     amsgrad = group["amsgrad"]
+            #     beta1, beta2 = group["betas"]
 
-                self._init_group_adam(
-                    group,
-                    params_with_grad,
-                    grads,
-                    amsgrad,
-                    exp_avgs,
-                    exp_avg_sqs,
-                    max_exp_avg_sqs,
-                    state_steps,
-                )
+            #     self._init_group_adam(
+            #         group,
+            #         params_with_grad,
+            #         grads,
+            #         amsgrad,
+            #         exp_avgs,
+            #         exp_avg_sqs,
+            #         max_exp_avg_sqs,
+            #         state_steps,
+            #     )
 
-                for p in group["params"]:
-                    state = self.state[p]
-                    state["prev_param"] = p.detach().clone()
+            #     for p in group["params"]:
+            #         state = self.state[p]
+            #         state["prev_param"] = p.detach().clone()
 
-                adamw(
-                    params_with_grad,
-                    grads,
-                    exp_avgs,
-                    exp_avg_sqs,
-                    max_exp_avg_sqs,
-                    state_steps,
-                    amsgrad=amsgrad,
-                    beta1=beta1,
-                    beta2=beta2,
-                    lr=group["lr"],
-                    weight_decay=group["weight_decay"],
-                    eps=group["eps"],
-                    maximize=group["maximize"],
-                    foreach=group["foreach"],
-                    capturable=group["capturable"],
-                    differentiable=group["differentiable"],
-                    fused=group["fused"],
-                    grad_scale=getattr(self, "grad_scale", None),
-                    found_inf=getattr(self, "found_inf", None),
-                )
+            #     adamw(
+            #         params_with_grad,
+            #         grads,
+            #         exp_avgs,
+            #         exp_avg_sqs,
+            #         max_exp_avg_sqs,
+            #         state_steps,
+            #         amsgrad=amsgrad,
+            #         beta1=beta1,
+            #         beta2=beta2,
+            #         lr=group["lr"],
+            #         weight_decay=group["weight_decay"],
+            #         eps=group["eps"],
+            #         maximize=group["maximize"],
+            #         foreach=group["foreach"],
+            #         capturable=group["capturable"],
+            #         differentiable=group["differentiable"],
+            #         fused=group["fused"],
+            #         grad_scale=getattr(self, "grad_scale", None),
+            #         found_inf=getattr(self, "found_inf", None),
+            #     )
 
         return loss
 
+# ADAM-LIKE optimizer  
 class AdamLike(Optimizer):
     def __init__(
         self,
@@ -640,6 +671,7 @@ class AdamLike(Optimizer):
 
         for group in self.param_groups:
             if self._is_sgd_group(group):
+                # Обработка  Adam-like
                 params_with_grad = []
                 grads = []
                 exp_avgs = []
@@ -665,12 +697,14 @@ class AdamLike(Optimizer):
                         state = self.state[p]
                         exp_avgs.append(state['exp_avg'])
                         exp_avg_sqs.append(state['exp_avg_sq'])
+                        # prev_grads.append(state['prev_grad'])
                         prev_grad = state['prev_grad']
                         rs.append(state['r'])
                         ds.append(state['d'])
                         state_steps.append(state['step'])
 
                 for i, param in enumerate(params_with_grad):
+                    # grad = grads[i] if not maximize else -grads[i]
                     grad = grads[i] 
                     step_t = state_steps[i].item()
                     exp_avg = exp_avgs[i]
@@ -683,7 +717,9 @@ class AdamLike(Optimizer):
                         prev_grad = torch.ones_like(grad)
                         self.state[param]['prev_grad'] = prev_grad
 
+                    # Обновление r и d 
                     if step_t > 0:
+                        # dot_product = (grad * prev_grad.sign()).sum().item()
                         dot_product = (grad.abs() * prev_grad.abs()).sum().item()
                         new_r = r.item() * (beta2**0.5) + (1 - beta2**0.5) * d.item() * dot_product
                         new_d = max(d.item(), new_r)
@@ -692,22 +728,42 @@ class AdamLike(Optimizer):
 
                     d_scalar = d.item()
                     
+                    # Обновление моментов
                     exp_avg.mul_(beta1).add_(grad, alpha=(1 - beta1) * d_scalar)
                     exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=(1 - beta2) * (d_scalar**2))
 
                     m_hat = exp_avg   
                     v_hat = exp_avg_sq 
-                    denom = v_hat - m_hat.square()  
+                    # Вычисление шага для каждого элемента
+                    denom = v_hat - m_hat.square()  # Поэлементное вычисление
                     denom = denom / (m_hat.square() + eps)
                     if warmup_steps > 0 and step_t < warmup_steps:
                         d_scalar = 1
                     step_size = (d_scalar**2 / (1 + denom)).sqrt()
                     
+                    # if step_t > 0 and i == 0:
+                    #     # print("\n", d_scalar, new_r, dot_product)
+                    #     # print(step_size)
+                    #     print(grad)
+                        # print(m_hat, v_hat)
+                    # if warmup_steps > 0 and step_t < warmup_steps:
+                    #     # step_size = lr_scalar 
+                    #     step_size = 1 
+                    # else:
+                        # step_size /= 10000
+                        # group['lr'] = step_size.mean() 
+                    # if i == 0:
+                    #     # print(step_t)
+                    #     print(d_scalar, denom)
+
                     step_size *= lr_scalar
+                    # Индивидуальное обновление параметра
                     param.add_(-exp_avg.sign() * step_size)
                     
+                    # print("\n",group['lr'], step_size.mean())
+
                     if weight_decay != 0:
-                        param.mul_(1 - lr_scalar * weight_decay)  
+                        param.mul_(1 - lr_scalar * weight_decay)  # Используем lr_current вместо step_size
 
                     self.state[param]['prev_grad'].copy_(grad)
                     self.state[param]['d'].copy_(d)
@@ -716,53 +772,104 @@ class AdamLike(Optimizer):
                     self.state[param]['exp_avg_sq'].copy_(exp_avg_sq)
                     state_steps[i] += 1
 
-            else:
-                params_with_grad = []
-                grads = []
-                exp_avgs = []
-                exp_avg_sqs = []
-                max_exp_avg_sqs = []
-                state_steps = []
+                # for i, param in enumerate(params_with_grad):
+                #     grad = grads[i] if not maximize else -grads[i]
+                #     step_t = state_steps[i].item()
+                #     exp_avg = exp_avgs[i]
+                #     exp_avg_sq = exp_avg_sqs[i]
+                #     r = rs[i]
+                #     d = ds[i]
+                #     prev_grad = prev_grads[i]
 
-                beta1, beta2 = group['betas']
-                lr = group['lr']
-                eps = group['eps']
-                weight_decay = group['weight_decay']
-                amsgrad = group['amsgrad']
-                maximize = group['maximize']
+                #     # Warmup
+                #     if warmup_steps > 0 and step_t < warmup_steps:
+                #         lr_current = (step_t + 1) / warmup_steps
+                #     else:
+                #         lr_current = 1
 
-                for p in group['params']:
-                    if p.grad is not None:
-                        params_with_grad.append(p)
-                        grads.append(p.grad)
-                        state = self.state[p]
-                        exp_avgs.append(state['exp_avg'])
-                        exp_avg_sqs.append(state['exp_avg_sq'])
-                        if amsgrad:
-                            max_exp_avg_sqs.append(state['max_exp_avg_sq'])
-                        else:
-                            max_exp_avg_sqs.append(None)
-                        state_steps.append(state['step'])
+                #     if prev_grad is None:
+                #         prev_grad = torch.zeros_like(grad)
+                #         prev_grads[i] = prev_grad
 
-                torch.optim._functional.adamw(
-                    params_with_grad,
-                    grads,
-                    exp_avgs,
-                    exp_avg_sqs,
-                    max_exp_avg_sqs,
-                    state_steps,
-                    amsgrad=amsgrad,
-                    beta1=beta1,
-                    beta2=beta2,
-                    lr=lr,
-                    weight_decay=weight_decay,
-                    eps=eps,
-                    maximize=maximize,
-                    foreach=False,
-                    capturable=group['capturable'],
-                    differentiable=group['differentiable'],
-                    fused=False,
-                )
+                #     # Обновление r и d
+                #     if step_t > 0:
+                #         dot_product = (grad * prev_grad.sign()).sum().item()
+                #         new_r = r.item() * (beta2**0.5) + (1 - beta2**0.5) * d.item() * dot_product
+                #         new_d = max(d.item(), new_r)
+                #         r.fill_(new_r)
+                #         d.fill_(new_d)
+
+                #     d_scalar = d.item()
+                    
+                #     # Обновление моментов
+                #     exp_avg.mul_(beta1).add_(grad, alpha=(1 - beta1) * d_scalar)
+                #     exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=(1 - beta2) * (d_scalar**2))
+
+                #     # Вычисление шага
+                #     denom = exp_avg_sq.mean() - exp_avg.mean().square()
+                #     denom = denom / (exp_avg.mean().square() + eps)
+                #     step_size = lr_current * (d_scalar**2 / (1 + denom)).sqrt() 
+
+                #     param.add_(exp_avg.sign(), alpha=-step_size.item())
+
+                    # if weight_decay != 0:
+                    #     param.mul_(1 - lr_current * weight_decay)
+                #         param.mul_(1 - step_size * weight_decay)
+                #     if step_t > warmup_steps:
+                #         lr = step_size
+
+                #     prev_grads[i].copy_(grad)
+                #     state_steps[i] += 1
+
+            # else:
+            #     # AdamW
+            #     params_with_grad = []
+            #     grads = []
+            #     exp_avgs = []
+            #     exp_avg_sqs = []
+            #     max_exp_avg_sqs = []
+            #     state_steps = []
+
+            #     beta1, beta2 = group['betas']
+            #     lr = group['lr']
+            #     # lr = 0.001
+            #     eps = group['eps']
+            #     weight_decay = group['weight_decay']
+            #     amsgrad = group['amsgrad']
+            #     maximize = group['maximize']
+
+            #     for p in group['params']:
+            #         if p.grad is not None:
+            #             params_with_grad.append(p)
+            #             grads.append(p.grad)
+            #             state = self.state[p]
+            #             exp_avgs.append(state['exp_avg'])
+            #             exp_avg_sqs.append(state['exp_avg_sq'])
+            #             if amsgrad:
+            #                 max_exp_avg_sqs.append(state['max_exp_avg_sq'])
+            #             else:
+            #                 max_exp_avg_sqs.append(None)
+            #             state_steps.append(state['step'])
+
+            #     torch.optim._functional.adamw(
+            #         params_with_grad,
+            #         grads,
+            #         exp_avgs,
+            #         exp_avg_sqs,
+            #         max_exp_avg_sqs,
+            #         state_steps,
+            #         amsgrad=amsgrad,
+            #         beta1=beta1,
+            #         beta2=beta2,
+            #         lr=lr,
+            #         weight_decay=weight_decay,
+            #         eps=eps,
+            #         maximize=maximize,
+            #         foreach=group['foreach'],
+            #         capturable=group['capturable'],
+            #         differentiable=group['differentiable'],
+            #         fused=group['fused'],
+            #     )
         for group in self.param_groups:
             for p in group['params']:
                 if p.grad is None:
@@ -779,7 +886,7 @@ class ProdigyWithAdam(Optimizer):
     def __init__(
         self,
         params,
-        L_inf: float = None,         
+        L_inf: float = None,          # Для совместимости интерфейса
         lower_bound: Optional[float] = None,
         d_0: Optional[float] = None,
         weight_decay: float = 0,
@@ -792,7 +899,7 @@ class ProdigyWithAdam(Optimizer):
         betas: Tuple[float, float] = (0.9, 0.999),
         epsilon: float = 1e-8,
         warmup_steps: int = 0,
-        amsgrad: bool = False,       
+        amsgrad: bool = False,        # Для AdamW
         *,
         maximize: bool = False,
         foreach: Optional[bool] = None,
@@ -827,6 +934,8 @@ class ProdigyWithAdam(Optimizer):
                 state = self.state[p]
                 device = p.device
                 state.setdefault('step', torch.tensor(0., device=device))
+                
+                # Инициализация состояний для Prodigy
                 state.setdefault('m', torch.zeros_like(p))
                 state.setdefault('v', torch.zeros_like(p))
                 state.setdefault('r', torch.tensor(0.0, device=device))
@@ -834,6 +943,7 @@ class ProdigyWithAdam(Optimizer):
                 state.setdefault('d', torch.tensor(group['d_0'] if group['d_0'] is not None else 1e-6, device=device))
                 state.setdefault('x0', p.data.clone().detach())
                 
+                # Инициализация состояний для AdamW
                 state.setdefault('exp_avg', torch.zeros_like(p))
                 state.setdefault('exp_avg_sq', torch.zeros_like(p))
                 if group.get('amsgrad', False):
@@ -851,6 +961,7 @@ class ProdigyWithAdam(Optimizer):
 
         for group in self.param_groups:
             if self._is_sgd_group(group):
+                # Обработка Prodigy
                 beta1, beta2 = group['betas']
                 lr = group['lr']
                 epsilon = group['epsilon']
@@ -875,13 +986,21 @@ class ProdigyWithAdam(Optimizer):
 
                     step_t.add_(1)
 
+                    # # Warmup learning rate
+                    # if warmup_steps > 0 and step < warmup_steps:
+                    #     lr_current = lr * (step + 1) / warmup_steps
+                    # else:
                     lr_current = lr
+                    # lr_current *= 1000 # default is 1, for AdamW is 1e-3
+                    # Обновляем моменты m и v
                     m.mul_(beta1).add_(grad * d, alpha=(1 - beta1))
                     v.mul_(beta2).addcmul_(grad, grad, value=(1 - beta2) * (d**2))
 
+                    # Вычисляем delta_x и скалярное произведение
                     delta_x = x0 - p.data
                     dot_product = torch.sum(grad * delta_x)
 
+                    # Обновляем r и s
                     beta2_sqrt = torch.sqrt(torch.tensor(beta2, device=r.device, dtype=r.dtype))
                     r_new = beta2_sqrt * r + (1 - beta2_sqrt) * lr_current * (d**2) * dot_product
                     s_new = beta2_sqrt * s + (1 - beta2_sqrt) * lr_current * (d**2) * grad
@@ -889,12 +1008,15 @@ class ProdigyWithAdam(Optimizer):
                     r.copy_(r_new)
                     s.copy_(s_new)
 
+                    # Вычисляем hat(d)
                     s_l1_norm = torch.sum(torch.abs(s_new))
                     hat_d = r_new / (s_l1_norm + epsilon)
 
+                    # Обновляем d
                     new_d = torch.max(d, hat_d)
                     d.copy_(new_d)
 
+                    # Обновляем параметр
                     if warmup_steps > 0 and step < warmup_steps:
                         d = 1
                     denominator = torch.sqrt(v) + d * epsilon
@@ -906,57 +1028,61 @@ class ProdigyWithAdam(Optimizer):
                     state['m'].copy_(m)
                     state['v'].copy_(v)
 
+                    # # Weight decay
                     if weight_decay != 0:
                         p.data.mul_(1 - lr_current * weight_decay)
 
-            else:
-                params_with_grad = []
-                grads = []
-                exp_avgs = []
-                exp_avg_sqs = []
-                max_exp_avg_sqs = []
-                state_steps = []
+            # else:
+            #     # Обработка AdamW
+            #     params_with_grad = []
+            #     grads = []
+            #     exp_avgs = []
+            #     exp_avg_sqs = []
+            #     max_exp_avg_sqs = []
+            #     state_steps = []
 
-                beta1, beta2 = group['betas']
-                lr = group['lr']
-                eps = group['epsilon']
-                weight_decay = group['weight_decay']
-                amsgrad = group['amsgrad']
-                maximize = group['maximize']
+            #     beta1, beta2 = group['betas']
+            #     lr = group['lr']
+            #     eps = group['epsilon']
+            #     weight_decay = group['weight_decay']
+            #     amsgrad = group['amsgrad']
+            #     maximize = group['maximize']
 
-                for p in group['params']:
-                    if p.grad is not None:
-                        params_with_grad.append(p)
-                        grads.append(p.grad)
-                        state = self.state[p]
-                        exp_avgs.append(state['exp_avg'])
-                        exp_avg_sqs.append(state['exp_avg_sq'])
-                        if amsgrad:
-                            max_exp_avg_sqs.append(state['max_exp_avg_sq'])
-                        else:
-                            max_exp_avg_sqs.append(None)
-                        state_steps.append(state['step'])
+            #     for p in group['params']:
+            #         if p.grad is not None:
+            #             params_with_grad.append(p)
+            #             grads.append(p.grad)
+            #             state = self.state[p]
+            #             exp_avgs.append(state['exp_avg'])
+            #             exp_avg_sqs.append(state['exp_avg_sq'])
+            #             if amsgrad:
+            #                 max_exp_avg_sqs.append(state['max_exp_avg_sq'])
+            #             else:
+            #                 max_exp_avg_sqs.append(None)
+            #             state_steps.append(state['step'])
 
-                torch.optim._functional.adamw(
-                    params_with_grad,
-                    grads,
-                    exp_avgs,
-                    exp_avg_sqs,
-                    max_exp_avg_sqs,
-                    state_steps,
-                    amsgrad=amsgrad,
-                    beta1=beta1,
-                    beta2=beta2,
-                    lr=lr,
-                    weight_decay=weight_decay,
-                    eps=eps,
-                    maximize=maximize,
-                    foreach=False,
-                    capturable=group['capturable'],
-                    differentiable=group['differentiable'],
-                    fused=False,
-                )
+            #     # Вызов AdamW реализации
+            #     torch.optim._functional.adamw(
+            #         params_with_grad,
+            #         grads,
+            #         exp_avgs,
+            #         exp_avg_sqs,
+            #         max_exp_avg_sqs,
+            #         state_steps,
+            #         amsgrad=amsgrad,
+            #         beta1=beta1,
+            #         beta2=beta2,
+            #         lr=lr,
+            #         weight_decay=weight_decay,
+            #         eps=eps,
+            #         maximize=maximize,
+            #         foreach=group['foreach'],
+            #         capturable=group['capturable'],
+            #         differentiable=group['differentiable'],
+            #         fused=group['fused'],
+            #     )
 
+        # Перемещение состояний на правильные устройства
         for group in self.param_groups:
             for p in group['params']:
                 if p.grad is None:

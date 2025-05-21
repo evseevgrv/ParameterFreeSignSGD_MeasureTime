@@ -273,48 +273,48 @@ class SgdWithAdam(Optimizer):  # noqa: D101
                         state = self.state[p]
                         state["momentum_buffer"] = momentum_buffer
                 
-            else:
-                params_with_grad = []
-                grads = []
-                exp_avgs = []
-                exp_avg_sqs = []
-                max_exp_avg_sqs = []
-                state_steps = []
-                amsgrad = group["amsgrad"]
-                beta1, beta2 = group["betas"]
+            # else:
+            #     params_with_grad = []
+            #     grads = []
+            #     exp_avgs = []
+            #     exp_avg_sqs = []
+            #     max_exp_avg_sqs = []
+            #     state_steps = []
+            #     amsgrad = group["amsgrad"]
+            #     beta1, beta2 = group["betas"]
 
-                self._init_group_adam(
-                    group,
-                    params_with_grad,
-                    grads,
-                    amsgrad,
-                    exp_avgs,
-                    exp_avg_sqs,
-                    max_exp_avg_sqs,
-                    state_steps,
-                )
+            #     self._init_group_adam(
+            #         group,
+            #         params_with_grad,
+            #         grads,
+            #         amsgrad,
+            #         exp_avgs,
+            #         exp_avg_sqs,
+            #         max_exp_avg_sqs,
+            #         state_steps,
+            #     )
 
-                adamw(
-                    params_with_grad,
-                    grads,
-                    exp_avgs,
-                    exp_avg_sqs,
-                    max_exp_avg_sqs,
-                    state_steps,
-                    amsgrad=amsgrad,
-                    beta1=beta1,
-                    beta2=beta2,
-                    lr=group["lr"],
-                    weight_decay=group["weight_decay"],
-                    eps=group["eps"],
-                    maximize=group["maximize"],
-                    foreach=group["foreach"],
-                    capturable=group["capturable"],
-                    differentiable=group["differentiable"],
-                    fused=group["fused"],
-                    grad_scale=getattr(self, "grad_scale", None),
-                    found_inf=getattr(self, "found_inf", None),
-                )
+            #     adamw(
+            #         params_with_grad,
+            #         grads,
+            #         exp_avgs,
+            #         exp_avg_sqs,
+            #         max_exp_avg_sqs,
+            #         state_steps,
+            #         amsgrad=amsgrad,
+            #         beta1=beta1,
+            #         beta2=beta2,
+            #         lr=group["lr"],
+            #         weight_decay=group["weight_decay"],
+            #         eps=group["eps"],
+            #         maximize=group["maximize"],
+            #         foreach=group["foreach"],
+            #         capturable=group["capturable"],
+            #         differentiable=group["differentiable"],
+            #         fused=group["fused"],
+            #         grad_scale=getattr(self, "grad_scale", None),
+            #         found_inf=getattr(self, "found_inf", None),
+            #     )
 
         return loss
 

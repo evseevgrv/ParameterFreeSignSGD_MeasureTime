@@ -712,8 +712,8 @@ def main(args):
     while not stop_flag:
         for batch_idx, batch in enumerate(dataloader):
             
-            torch.cuda.synchronize()
-            step_start_time = time.time()
+            
+            
 
             # this code is for "honest" loading from checkpoint 
             # since we need to preserve data order.
@@ -817,9 +817,14 @@ def main(args):
             #      for group in optimizer.param_groups:
             #          for p in group["params"]:
             #              optimizer.state[p]["prev_grad"] = custom_grad[p].clone()
+            torch.cuda.synchronize()
+            step_start_time = time.time()
 
             optimizer.step(closure)
-            
+
+            torch.cuda.synchronize()
+            step_time = time.time() - step_start_time
+
             if global_rank == 0 and args.debug_print:
                 p = next(model.parameters())
                 print(f"Weights: {p.data.dtype}\nGrads: {p.grad.data.dtype}\nOptimizer state: {optimizer.state[p]['exp_avg'].dtype}")
@@ -830,36 +835,36 @@ def main(args):
             update_time = time.time() - update_time
 
             # evaluation
-            if update_step % args.eval_every == 0:
-                logger.info(f"Performing evaluation at step {update_step}")
-                total_loss, evaluated_on_tokens, stable_rank_dict = evaluate_model(
-                    model, preprocess_batched, pad_idx, global_rank, world_size, device, args.eval_batch_size, 
-                    args_dtype=args.dtype, args_amp=args.amp, short_debug_eval=args.debug
-                )
-                if global_rank == 0 and args.wandb:
-                    wandb.log({
-                        "final_eval_loss": total_loss,
-                        "final_eval_tokens": evaluated_on_tokens,
-                        },
-                        step=update_step,
-                    )
-                if args.run_old_eval:
-                    total_loss_old, evaluated_on_tokens = evaluate_model_old(model, preprocess_batched, pad_idx, global_rank, world_size, device, args)
-                    if global_rank == 0 and args.wandb:
-                        wandb.log({
-                            "final_eval_loss_old": total_loss_old,
-                            },
-                            step=update_step,
-                        )
-                torch.cuda.empty_cache()
-                logger.info(f"Eval loss at step {update_step}: {total_loss}")
+            # if update_step % args.eval_every == 0:
+            #     logger.info(f"Performing evaluation at step {update_step}")
+            #     total_loss, evaluated_on_tokens, stable_rank_dict = evaluate_model(
+            #         model, preprocess_batched, pad_idx, global_rank, world_size, device, args.eval_batch_size, 
+            #         args_dtype=args.dtype, args_amp=args.amp, short_debug_eval=args.debug
+            #     )
+            #     if global_rank == 0 and args.wandb:
+            #         wandb.log({
+            #             "final_eval_loss": total_loss,
+            #             "final_eval_tokens": evaluated_on_tokens,
+            #             },
+            #             step=update_step,
+            #         )
+            #     if args.run_old_eval:
+            #         total_loss_old, evaluated_on_tokens = evaluate_model_old(model, preprocess_batched, pad_idx, global_rank, world_size, device, args)
+            #         if global_rank == 0 and args.wandb:
+            #             wandb.log({
+            #                 "final_eval_loss_old": total_loss_old,
+            #                 },
+            #                 step=update_step,
+            #             )
+            #     torch.cuda.empty_cache()
+            #     logger.info(f"Eval loss at step {update_step}: {total_loss}")
 
             # save checkpoint by save_every
-            if update_step % args.save_every == 0:
-                current_model_directory = f"{os.path.join(args.general_save_dir, args.save_dir)}"
-                logger.info(f"Saving model and optimizer to {current_model_directory}, update step {update_step}")
-                save_checkpoint(args, model, optimizer, scheduler, global_rank, world_size, update_step, global_step, 
-                    run_config, tokens_seen, tokens_seen_before, update_time, seed_for_shuffle)
+            # if update_step % args.save_every == 0:
+            #     current_model_directory = f"{os.path.join(args.general_save_dir, args.save_dir)}"
+            #     logger.info(f"Saving model and optimizer to {current_model_directory}, update step {update_step}")
+            #     save_checkpoint(args, model, optimizer, scheduler, global_rank, world_size, update_step, global_step, 
+            #         run_config, tokens_seen, tokens_seen_before, update_time, seed_for_shuffle)
 
             if args.optimizer in ["aid_sign_sgd", "aid_with_adam"] and update_step > args.warmup_steps:
                 for group in optimizer.param_groups:
@@ -890,8 +895,7 @@ def main(args):
                 gc.collect()
 
 
-            torch.cuda.synchronize()
-            step_time = time.time() - step_start_time
+            
 
             if world_size > 1:
                 step_time_tensor = torch.tensor([step_time], device=device)
