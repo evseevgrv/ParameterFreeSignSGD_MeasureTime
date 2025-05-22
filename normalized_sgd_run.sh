@@ -43,8 +43,8 @@ command+=" --update_gap 20"
 command+=" --proj_embeds"
 command+=" --proj_norms"
 # command+=" --proj_logits"
-command+=" --sgd_sign_update True"
-command+=" --normalized True"
+command+=" --sgd_sign_update"
+command+=" --normalized"
 # seed
 command+=" --seed 0"
  
