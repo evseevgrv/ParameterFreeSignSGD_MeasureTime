@@ -187,7 +187,7 @@ class SgdWithAdam(Optimizer):  # noqa: D101
         super().__init__([group for group in params], defaults)
         del self.param_groups
         sgd_params = [group for group in params if self._is_sgd_group(group)]
-        adam_params = [group for group in params if not self._is_sgd_group(group)]
+        # adam_params = [group for group in params if not self._is_sgd_group(group)]
 
         sgd = SgdWithSign(
             sgd_params,
@@ -209,23 +209,24 @@ class SgdWithAdam(Optimizer):  # noqa: D101
                 "normalized": normalized
             })
 
-        adam = torch.optim.AdamW(
-            adam_params,
-            lr=adam_lr,
-            betas=adam_betas,
-            eps=adam_eps,
-            weight_decay=weight_decay,
-            amsgrad=adam_amsgrad,
+        # adam = torch.optim.AdamW(
+        #     adam_params,
+        #     lr=adam_lr,
+        #     betas=adam_betas,
+        #     eps=adam_eps,
+        #     weight_decay=weight_decay,
+        #     amsgrad=adam_amsgrad,
 
-            maximize=maximize,
-            foreach=foreach,
-            fused=fused,
-            differentiable=differentiable,
-        )
-        self.param_groups = sgd.param_groups + adam.param_groups
+        #     maximize=maximize,
+        #     foreach=foreach,
+        #     fused=fused,
+        #     differentiable=differentiable,
+        # )
+        # self.param_groups = sgd.param_groups + adam.param_groups
+        self.param_groups = sgd.param_groups 
 
         self._init_group_sgd_advanced = SgdWithSign._init_group.__get__(self)
-        self._init_group_adam = AdamW._init_group.__get__(self)
+        # self._init_group_adam = AdamW._init_group.__get__(self)
 
     def _is_sgd_group(self, group):
         return group.get("is_proj_params", False) or group.get("is_sgd_params", False)
